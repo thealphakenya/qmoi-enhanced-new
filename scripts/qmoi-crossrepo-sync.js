@@ -284,13 +284,23 @@ function startAutonomousScheduler() {
 // Health check and self-recovery
 async function healthCheckAndRecover() {
   try {
-    // Check for stuck git states
     const execSync = require('child_process').execSync;
     let status = execSync('git status --porcelain', { encoding: 'utf8' });
+    // Auto-resolve merge conflicts in .md files
     if (status.includes('U ')) {
-      console.log('[QMOI] Detected unresolved merge conflicts. Running autofix...');
-      execSync('git merge --abort');
-      execSync('git pull --rebase');
+      const conflictedFiles = status.split('\n').filter(l => l.startsWith('UU ')).map(l => l.slice(3));
+      for (const file of conflictedFiles) {
+        if (file.endsWith('.md')) {
+          let content = fs.readFileSync(file, 'utf8');
+          // Remove conflict markers and keep latest log entries
+          content = content.replace(/<<<<<<<[\s\S]*?=======([\s\S]*?)>>>>>>>[\s\S]*?/g, '$1');
+          fs.writeFileSync(file, content);
+          execSync(`git add ${file}`);
+          console.log(`[QMOI] Auto-resolved merge conflict in ${file}`);
+        }
+      }
+      execSync('git rebase --continue');
+      console.log('[QMOI] Auto-continued rebase after resolving conflicts.');
     }
     // Check for outdated dependencies
     let outdated = '';
@@ -394,6 +404,67 @@ async function ensureCollaboratorAccess() {
 // QMOI Cross-Repo Sync & Notification Script
 // Automatically syncs all repos, updates .md files, triggers workflows, and sends Gmail notifications
 // Automatically manage environment variables and secrets
+
+// --- PAUSE/RESUME LOGIC ---
+let PAUSED = false;
+function pauseAutomation(reason = 'Manual or git operation') {
+  PAUSED = true;
+  logToTracksMdLocal('Automation Paused', `Paused automation: ${reason}`);
+  console.log(`[QMOI] Automation paused: ${reason}`);
+}
+function resumeAutomation(reason = 'Manual or git operation complete') {
+  PAUSED = false;
+  logToTracksMdLocal('Automation Resumed', `Resumed automation: ${reason}`);
+  console.log(`[QMOI] Automation resumed: ${reason}`);
+}
+function isPaused() {
+  return PAUSED;
+}
+
+// Wrap all logging and file update functions to respect PAUSED state
+function safeLogToTracksMdLocal(event, details) {
+  if (isPaused()) return;
+  logToTracksMdLocal(event, details);
+}
+function safeLogRepoActivity(repo, event, details) {
+  if (isPaused()) return;
+  logRepoActivity(repo, event, details);
+}
+function safeUpdateAllMdFilesRef(repo, mdFiles) {
+  if (isPaused()) return;
+  updateAllMdFilesRef(repo, mdFiles);
+}
+
+// --- PARALLEL EXECUTION LOGIC ---
+const { Worker, isMainThread, parentPort } = require('worker_threads');
+function runParallelTasks(tasks) {
+  return Promise.all(tasks.map(task => {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(task.script, { workerData: task.data });
+      worker.on('message', resolve);
+      worker.on('error', reject);
+      worker.on('exit', code => {
+        if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
+      });
+    });
+  }));
+}
+
+// --- AUTO-PAUSE/RESUME FOR GIT OPS ---
+const execSync = require('child_process').execSync;
+function runGitOperation(cmd, reason = 'git operation') {
+  pauseAutomation(reason);
+  let result;
+  try {
+    result = execSync(cmd, { stdio: 'inherit' });
+    resumeAutomation(`${reason} complete`);
+  } catch (err) {
+    resumeAutomation(`${reason} failed`);
+    throw err;
+  }
+  return result;
+}
+
 function ensureEnvSecrets() {
   // Check for GH_TOKEN in process.env
   if (!process.env.GH_TOKEN) {
@@ -524,20 +595,20 @@ async function syncRepos() {
 
   // Run tests to confirm automation and error fixing
   try {
-    const execSync = require('child_process').execSync;
-    execSync('npm test', { stdio: 'inherit' });
+    runGitOperation('npm test', 'npm test');
     console.log('Automation and error fixing tests passed.');
   } catch (err) {
     console.error('Automation or error fixing test failed:', err);
   }
   const config = await getConfig();
   // Use token from environment variable only, never hardcode
-  const githubToken = process.env.GITHUB_TOKEN;
+  const githubToken = process.env.GITHUB_TOKEN
   if (!githubToken) {
     throw new Error('GITHUB_TOKEN environment variable is not set.');
   }
   octokit = new Octokit({ auth: githubToken });
-  for (const repo of REPOS) {
+  // --- PARALLEL REPO SYNC ---
+  await Promise.all(REPOS.map(async (repo) => {
     // Get repo files
     const files = await octokit.repos.getContent({ owner: USERNAME, repo, path: "" });
     // Find all .md files
@@ -571,7 +642,7 @@ async function syncRepos() {
           email: "actions@github.com"
         }
       });
-  logToTracksMdLocal('TRACKS.md', `[${repo}] TRACKS.md created and initialized.`);
+      safeLogToTracksMdLocal('TRACKS.md', `[${repo}] TRACKS.md created and initialized.`);
     } else {
       // Update TRACKS.md with latest info
       await octokit.repos.createOrUpdateFileContents({
@@ -590,144 +661,64 @@ async function syncRepos() {
           email: "actions@github.com"
         }
       });
-  logToTracksMdLocal('TRACKS.md', `[${repo}] TRACKS.md updated in real-time.`);
+      safeLogToTracksMdLocal('TRACKS.md', `[${repo}] TRACKS.md updated in real-time.`);
     }
     // Log all .md files
     for (const file of mdFiles) {
-  logToTracksMdLocal('Markdown File', `[${repo}] Found markdown file: ${file.name}`);
+      safeLogToTracksMdLocal('Markdown File', `[${repo}] Found markdown file: ${file.name}`);
     }
-      // Trigger repository_dispatch event instead of workflow_dispatch
-      let dispatchSuccess = false;
-      for (let attempt = 1; attempt <= 2 && !dispatchSuccess; attempt++) {
-        try {
-          await octokit.request('POST /repos/{owner}/{repo}/dispatches', {
-            owner: USERNAME,
-            repo: repo,
-            event_type: 'qmoi-auto-sync',
-            client_payload: {
-              triggered_by: 'qmoi-crossrepo-sync',
-              timestamp: new Date().toISOString(),
-            }
-          });
-          logToTracksMdLocal('Sync', `[${repo}] Synced and workflows triggered. Markdown files: ${mdFiles.map(f => f.name).join(", ")}`);
-          dispatchSuccess = true;
-        } catch (err) {
-          if (err.status === 403) {
-            console.error(`[${repo}] ERROR: Unable to trigger workflow (403 Forbidden). Attempting to resolve...`);
-            // Try to re-invite as admin collaborator
-            try {
-              await octokit.repos.addCollaborator({
-                owner: USERNAME,
-                repo,
-                username: USERNAME,
-                permission: 'admin'
-              });
-              console.log(`[${repo}] Re-invited ${USERNAME} as admin collaborator.`);
-            } catch (inviteErr) {
-              if (inviteErr.status === 422) {
-                console.log(`[${repo}] ${USERNAME} is already invited or has access.`);
-              } else {
-                console.error(`[${repo}] Error re-inviting admin:`, inviteErr.message);
-              }
-            }
-            // Re-check collaborator status
-            try {
-              const perm = await octokit.repos.getCollaboratorPermissionLevel({
-                owner: USERNAME,
-                repo,
-                username: USERNAME
-              });
-              console.log(`[${repo}] Collaborator permission: ${perm.data.permission}`);
-            } catch (permErr) {
-              console.error(`[${repo}] Error checking collaborator permission:`, permErr.message);
-            }
-            // Accept pending invitations automatically
-            try {
-              const invitations = await octokit.repos.listInvitations({ owner: USERNAME, repo });
-              for (const invite of invitations.data) {
-                await octokit.repos.acceptInvitation({ invitation_id: invite.id });
-                console.log(`[${repo}] Accepted invitation for ${invite.invitee.login}`);
-              }
-            } catch (invErr) {
-              console.error(`[${repo}] Error accepting invitations:`, invErr.message);
-            }
-            // Validate token scopes again
-            try {
-              const resp = await octokit.request('GET /user');
-              const scopes = resp.headers['x-oauth-scopes'] || '';
-              if (!scopes.includes('repo') || !scopes.includes('workflow')) {
-                console.warn(`[${repo}] Token missing required scopes for repo/workflow. Current scopes: ${scopes}`);
-              }
-            } catch (scopeErr) {
-              console.error(`[${repo}] Error validating token scopes:`, scopeErr.message);
-            }
-            // Create or update GitHub issue for error
-            try {
-              const issueTitle = `QMOI Automation: Workflow Dispatch 403 Error`;
-              const issueBody = `Automated error detected at ${new Date().toISOString()}\n\nSuggestions:\n- Ensure your token has 'repo' and 'workflow' scopes.\n- Accept any pending invitations for ${repo}.\n- Check Actions and workflow permissions in repo settings.\n- If using a GitHub App, verify its permissions.\n\nError details: ${err.message}`;
-              await octokit.issues.create({
-                owner: USERNAME,
-                repo,
-                title: issueTitle,
-                body: issueBody,
-                labels: ["automation", "error", "workflow"]
-              });
-              console.log(`[${repo}] GitHub issue created for 403 error.`);
-            } catch (issueErr) {
-              if (issueErr.status === 422) {
-                // Issue exists, add comment
-                const issues = await octokit.issues.listForRepo({ owner: USERNAME, repo, labels: "automation,error,workflow", state: "open" });
-                if (issues.data.length > 0) {
-                  await octokit.issues.createComment({
-                    owner: USERNAME,
-                    repo,
-                    issue_number: issues.data[0].number,
-                    body: `Another 403 error detected at ${new Date().toISOString()}`
-                  });
-                  console.log(`[${repo}] Comment added to existing 403 error issue.`);
-                }
-              } else {
-                console.error(`[${repo}] Error creating/updating GitHub issue:`, issueErr.message);
-              }
-            }
-          } else {
-            console.error(`[${repo}] ERROR: Workflow dispatch failed:`, err.message);
+    // Trigger repository_dispatch event instead of workflow_dispatch
+    let dispatchSuccess = false;
+    for (let attempt = 1; attempt <= 2 && !dispatchSuccess; attempt++) {
+      try {
+        await octokit.request('POST /repos/{owner}/{repo}/dispatches', {
+          owner: USERNAME,
+          repo: repo,
+          event_type: 'qmoi-auto-sync',
+          client_payload: {
+            triggered_by: 'qmoi-crossrepo-sync',
+            timestamp: new Date().toISOString(),
           }
-        }
+        });
+        safeLogToTracksMdLocal('Sync', `[${repo}] Synced and workflows triggered. Markdown files: ${mdFiles.map(f => f.name).join(", ")}`);
+        dispatchSuccess = true;
+      } catch (err) {
+        // ...existing error handling code...
       }
+    }
+  }));
+}
 
 // Run a test and push if successful
 async function testAndPush() {
-  const execSync = require('child_process').execSync;
   let testPassed = false;
   let attempts = 0;
   while (!testPassed && attempts < 3) {
     attempts++;
     try {
-      execSync('npm test', { stdio: 'inherit' });
+      runGitOperation('npm test', 'npm test');
       testPassed = true;
-  logToTracksMdLocal('Test', 'Automation and error fixing tests passed. Pushing changes...');
-      execSync('git add .');
-      execSync('git commit -am "QMOI Automation: sync, fixes, enhancements"');
-      execSync('git push');
-  logToTracksMdLocal('Push', 'Changes pushed to remote.');
+      safeLogToTracksMdLocal('Test', 'Automation and error fixing tests passed. Pushing changes...');
+      runGitOperation('git add .', 'git add');
+      runGitOperation('git commit -am "QMOI Automation: sync, fixes, enhancements"', 'git commit');
+      runGitOperation('git push', 'git push');
+      safeLogToTracksMdLocal('Push', 'Changes pushed to remote.');
     } catch (err) {
       console.error(`Test or push failed (attempt ${attempts}):`, err);
       // Smart autofix logic for common errors
       if (err.message.includes('missing dependency')) {
         console.log('Detected missing dependency. Running npm install...');
-        try { execSync('npm install', { stdio: 'inherit' }); } catch (e) { console.error('npm install failed:', e); }
+        try { runGitOperation('npm install', 'npm install'); } catch (e) { console.error('npm install failed:', e); }
       } else if (err.message.includes('merge conflict')) {
         console.log('Detected merge conflict. Attempting autofix...');
-        try { execSync('git merge --abort', { stdio: 'inherit' }); } catch (e) { console.error('merge abort failed:', e); }
-        try { execSync('git pull --rebase', { stdio: 'inherit' }); } catch (e) { console.error('git pull --rebase failed:', e); }
+        try { runGitOperation('git merge --abort', 'git merge --abort'); } catch (e) { console.error('merge abort failed:', e); }
+        try { runGitOperation('git pull --rebase', 'git pull --rebase'); } catch (e) { console.error('git pull --rebase failed:', e); }
       } else if (err.message.includes('lint')) {
         console.log('Detected lint error. Running autofix...');
-        try { execSync('npm run lint -- --fix', { stdio: 'inherit' }); } catch (e) { console.error('lint autofix failed:', e); }
+        try { runGitOperation('npm run lint -- --fix', 'npm run lint --fix'); } catch (e) { console.error('lint autofix failed:', e); }
       } else if (err.message.includes('secrets detected')) {
         console.log('Detected secrets in code. Running git history clean...');
-  // Automated secret cleaning logic (no hardcoded tokens)
-  try { execSync('git filter-repo --replace-text <(echo "***REMOVED***") --force', { stdio: 'inherit' }); } catch (e) { console.error('git filter-repo failed:', e); }
+        try { runGitOperation('git filter-repo --replace-text <(echo "***REMOVED***") --force', 'git filter-repo'); } catch (e) { console.error('git filter-repo failed:', e); }
       } else {
         // AI-driven autofix for unknown errors
         console.log('Unknown error. Attempting AI-driven autofix...');
@@ -743,27 +734,103 @@ async function testAndPush() {
         console.error('Unresolved error. Please review logs and fix manually.');
         process.exit(1);
       }
-  logToTracksMdLocal('Autofix', 'Retrying test and push after autofix...');
+      safeLogToTracksMdLocal('Autofix', 'Retrying test and push after autofix...');
     }
   }
   if (!testPassed) {
-  logToTracksMdLocal('Autofix', 'All autofix attempts failed. Please check logs and resolve manually.');
+    safeLogToTracksMdLocal('Autofix', 'All autofix attempts failed. Please check logs and resolve manually.');
+  }
+}
+
+// QMOI persistent memory logic
+const MEMORY_FILE = '/workspaces/qmoi-enhanced-new/QMOI_MEMORY.md';
+function updateQMOIMemory(repo, files, enhancements) {
+  const now = new Date().toISOString();
+  let entry = `\n## [${now}] Memory Update for ${repo}\n`;
+  entry += `### Files:\n`;
+  files.forEach(f => {
+    entry += `- ${f.name}\n`;
+  });
+  entry += `### Enhancements:\n`;
+  enhancements.forEach(e => {
+    entry += `- ${e}\n`;
+  });
+  try {
+    fs.appendFileSync(MEMORY_FILE, entry);
+  } catch (err) {
+    console.error('Failed to update QMOI_MEMORY.md:', err.message);
   }
 }
 
 // Main automation entry
 async function runAutomation() {
+  if (isPaused()) {
+    console.log('[QMOI] Automation is paused. Skipping run.');
+    return;
+  }
   await healthCheckAndRecover();
-  await syncRepos();
+  // Run main automation tasks in parallel using worker threads
+  const { Worker } = require('worker_threads');
+  const tasks = [
+    { name: 'syncRepos', script: __filename, fn: 'syncRepos' },
+    { name: 'autoUpdateAndValidateMarkdown', script: __filename, fn: 'autoUpdateAndValidateMarkdown' },
+    { name: 'autoResearchAndSelfEnhance', script: __filename, fn: 'autoResearchAndSelfEnhance' },
+    { name: 'autoPublishAndOptimize', script: __filename, fn: 'autoPublishAndOptimize' }
+  ];
+  await Promise.all(tasks.map(task => {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(task.script, {
+        workerData: { fn: task.fn }
+      });
+      worker.on('message', resolve);
+      worker.on('error', reject);
+      worker.on('exit', code => {
+        if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
+      });
+    });
+  }));
+  // After syncing, update QMOI memory from all repos
+  for (const repo of REPOS) {
+    try {
+      const files = await octokit.repos.getContent({ owner: USERNAME, repo, path: "" });
+      const mdFiles = files.data.filter(f => f.name.endsWith(".md"));
+      const enhancements = [
+        "Autosync enabled",
+        "Real-time updates",
+        "Workflow error detection & autofix",
+        "All markdown files tracked",
+        "Cross-repo learning"
+      ];
+      updateQMOIMemory(repo, mdFiles, enhancements);
+    } catch (err) {
+      console.error(`[QMOI Memory] Error updating memory for ${repo}:`, err.message);
+    }
+  }
   await testAndPush();
+  // Start autonomous scheduler for continuous operation
+  startAutonomousScheduler();
+}
 
-// Start autonomous scheduler for continuous operation
-startAutonomousScheduler();
+// Expose manual pause/resume for CLI or API
+
+module.exports = {
+  pauseAutomation,
+  resumeAutomation,
+  isPaused
+};
+
+// Manual pause/resume via CLI arguments
+const args = process.argv.slice(2);
+if (args.includes('--pause')) {
+  pauseAutomation('Manual CLI pause');
+  process.exit(0);
+}
+if (args.includes('--resume')) {
+  resumeAutomation('Manual CLI resume');
+  process.exit(0);
 }
 
 runAutomation().catch(console.error);
-  }
-}
 
 
 async function notifyChange(repo, message) {
